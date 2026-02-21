@@ -80,6 +80,21 @@ def string_similarity(s1: str, s2: str):
     
     return char_similarity
 
+def is_numerical_answer(answer: str) -> bool:
+    """Cevabın sayısal olup olmadığını kontrol et"""
+    if not answer:
+        return False
+    
+    # Sayısal karakterleri temizle ve kontrol et
+    cleaned = answer.strip().replace(',', '.').replace(' ', '')
+    
+    # Basit sayı kontrolü (ondalıklı sayılar dahil)
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
+
 def run_ollama(prompt: str, model: str = "gemma3:270m"):
     """Ollama modelini çalıştır"""
     try:
@@ -100,18 +115,14 @@ def run_ollama(prompt: str, model: str = "gemma3:270m"):
     except Exception as e:
         return ""
 
-def score_to_points(score: int):
+def score_to_points(score: int, is_numerical: bool = False):
     """Benzerlik skorunu puana çevir"""
-    if score >= 90:  # Aynı anlam
-        return 1.0
-    elif score >= 70:  # Çok yakın
-        return 0.75
-    elif score >= 50:  # Kısmen doğru
-        return 0.5
-    elif score >= 30:  # Az benzer
-        return 0.25
-    else:  # Farklı
-        return 0.0
+    if is_numerical:
+        # Sayısal cevaplar için binary değerlendirme
+        return 1.0 if score >= 90 else 0.0
+    else:
+        # Sözel cevaplar için binary değerlendirme (30 ve üzeri doğru)
+        return 1.0 if score >= 30 else 0.0
 
 def evaluate_answer(student_answer: str, correct_answer: str):
     """Öğrenci cevabını değerlendir (alternatif cevapları da kontrol et)"""
@@ -121,6 +132,9 @@ def evaluate_answer(student_answer: str, correct_answer: str):
     
     # Alternatif cevapları ayır (/ ile)
     alternative_answers = [ans.strip() for ans in correct_answer.split('/')]
+    
+    # Cevabın sayısal olup olmadığını kontrol et (ilk alternatif üzerinden)
+    is_numerical = any(is_numerical_answer(ans) for ans in alternative_answers)
     
     best_score = 0
     best_method = ""
@@ -132,6 +146,23 @@ def evaluate_answer(student_answer: str, correct_answer: str):
     for alt_answer in alternative_answers:
         # 1. String benzerliği hesapla (OCR düzeltmeli)
         str_similarity = string_similarity(student_answer, alt_answer)
+        
+        # Sayısal cevaplar için tam eşleşme kontrolü
+        if is_numerical:
+            # Sayısal değerleri karşılaştır
+            try:
+                # Sayısal değerleri normalize et
+                student_num = float(student_answer.strip().replace(',', '.'))
+                correct_num = float(alt_answer.strip().replace(',', '.'))
+                
+                # Tam eşleşme kontrolü
+                if abs(student_num - correct_num) < 0.01:  # Küçük tolerans
+                    str_similarity = 100
+                else:
+                    str_similarity = 0
+            except ValueError:
+                # Sayısal dönüşüm başarısız, normal string benzerliğini kullan
+                pass
         
         # Yüksek string benzerliği varsa LLM'e gerek yok
         if str_similarity >= 85:
@@ -148,18 +179,30 @@ def evaluate_answer(student_answer: str, correct_answer: str):
         norm_student = normalize_text(student_answer)
         norm_correct = normalize_text(alt_answer)
         
-        prompt = f"""İki cevap aynı anlamda mı? OCR hataları olabilir (ä->a, ö->o, ü->u, ß->ss gibi dönüşümler yapıldı).
+        # Sayısal cevaplar için farklı prompt kullan
+        if is_numerical:
+            prompt = f"""İki cevap sayısal olarak aynı mı? OCR hataları olabilir.
+
+Doğru (normalize): {norm_correct}
+Öğrenci (normalize): {norm_student}
+
+Sayısal cevaplar için sadece tam eşleşme kabul edilir.
+Yanıt sadece sayı olmalı (0 veya 100):
+100: Sayısal olarak aynı (küçük yazım hataları tolere edilebilir)
+0: Sayısal olarak farklı
+
+Sadece sayı yaz:"""
+        else:
+            prompt = f"""İki cevap aynı anlamda mı? OCR hataları olabilir (ä->a, ö->o, ü->u, ß->ss gibi dönüşümler yapıldı).
 
 Doğru (normalize): {norm_correct}
 Öğrenci (normalize): {norm_student}
 
 Büyük/küçük harf önemsiz. Yazım hataları tolere et.
+Sayısal cevaplar için benzerlik puanı verme. Ya doğru ya yanlış olarak değerlendir.
 
-Benzerlik puanı ver (0-100):
-90-100: Aynı anlam
-70-89: Çok yakın
-50-69: Kısmen doğru
-30-49: Az benzer
+Sözel olan cevaplar için benzerlik puanı ver (0-100):
+30-100: Benzer
 0-29: Farklı
 
 Sadece sayı yaz:"""
@@ -172,8 +215,13 @@ Sadece sayı yaz:"""
         except:
             llm_score = 0
         
-        # String ve LLM skorunun en yükseğini al
-        final_score = max(str_similarity, llm_score)
+        # Sayısal cevaplar için farklı birleştirme stratejisi
+        if is_numerical:
+            # Sayısal cevaplarda ya tam doğru ya tam yanlış
+            final_score = 100 if (str_similarity >= 90 or llm_score >= 90) else 0
+        else:
+            # Sözel cevaplarda en yüksek skoru al
+            final_score = max(str_similarity, llm_score)
         
         if final_score > best_score:
             best_score = final_score
@@ -182,20 +230,17 @@ Sadece sayı yaz:"""
             best_str_sim = str_similarity
             best_llm_sim = llm_score
     
-    # Puan katsayısını hesapla
-    puan_katsayi = score_to_points(best_score)
+    # Puan katsayısını hesapla (sayısal/sözel ayrımına göre)
+    puan_katsayi = score_to_points(best_score, is_numerical)
     
     # Durumu belirle
-    if puan_katsayi >= 0.9:
-        durum = "Tam Doğru"
-    elif puan_katsayi >= 0.7:
-        durum = "Çok Yakın"
-    elif puan_katsayi >= 0.5:
-        durum = "Kısmen Doğru"
-    elif puan_katsayi >= 0.25:
-        durum = "Az Benzer"
+    if puan_katsayi == 0:
+        if not student_answer:
+            durum = "Boş"
+        else:
+            durum = "Yanlış"
     else:
-        durum = "Yanlış"
+        durum = "Doğru"
     
     return {
         "puan_katsayi": puan_katsayi,
@@ -203,7 +248,9 @@ Sadece sayı yaz:"""
         "yontem": best_method,
         "eslesen_cevap": best_answer,
         "string_benzerlik": round(best_str_sim, 1),
-        "llm_benzerlik": best_llm_sim
+        "llm_benzerlik": best_llm_sim,
+        "sayisal_cevap": is_numerical,
+        "benzerlik_skoru": round(best_score, 1)
     }
 
 def load_json(file_path: str):
@@ -231,8 +278,11 @@ def main():
     dogru = 0
     yanlis = 0
     bos = 0
+    sayisal_sayisi = 0
+    sozel_sayisi = 0
     
-    print(f"\n🔍 Değerlendiriliyor (OCR karakter düzeltmeleri aktif)...\n")
+    print(f"\n🔍 Değerlendiriliyor (OCR karakter düzeltmeleri aktif)...")
+    print(f"📝 Sözel sorular: 30 ve üzeri benzerlik DOĞRU, 29 ve altı YANLIŞ\n")
     
     for q_num, correct_ans in correct_answers.items():
         student_ans = student_answers.get(str(q_num), "")
@@ -247,9 +297,14 @@ def main():
         }
         
         # İstatistik
-        if eval_result["puan_katsayi"] == 0 and not student_ans:
+        if eval_result["sayisal_cevap"]:
+            sayisal_sayisi += 1
+        else:
+            sozel_sayisi += 1
+        
+        if not student_ans:
             bos += 1
-        elif eval_result["puan_katsayi"] >= 0.7:
+        elif eval_result["puan_katsayi"] == 1.0:
             dogru += 1
         else:
             yanlis += 1
@@ -257,10 +312,23 @@ def main():
         toplam_katsayi += eval_result["puan_katsayi"]
         
         # İlerleme göster
-        status = "✓" if eval_result["puan_katsayi"] >= 0.7 else "✗"
-        print(f"{status} Soru {q_num}: {eval_result['puan_katsayi']*100:.0f}/100 - {eval_result['durum']} ({eval_result['yontem']})")
+        if not student_ans:
+            status = "⭕"
+        elif eval_result["puan_katsayi"] == 1.0:
+            status = "✓"
+        else:
+            status = "✗"
+        
+        tip = "🔢" if eval_result["sayisal_cevap"] else "📝"
+        
+        # Renkli ve detaylı gösterim
+        if eval_result["sayisal_cevap"]:
+            print(f"{status} {tip} Soru {q_num}: {eval_result['puan_katsayi']*100:.0f}/100 - {eval_result['durum']} ({eval_result['yontem']}) [Skor: {eval_result['benzerlik_skoru']}]")
+        else:
+            renk = "✅" if eval_result['benzerlik_skoru'] >= 30 else "❌"
+            print(f"{status} {tip} Soru {q_num}: {eval_result['puan_katsayi']*100:.0f}/100 - {eval_result['durum']} ({eval_result['yontem']}) [Benzerlik: {eval_result['benzerlik_skoru']}/100 {renk}]")
     
-    # Toplamı 100'e ölçekle
+    # Toplamı hesapla
     max_katsayi = len(correct_answers)
     yuzdelik_puan = (toplam_katsayi / max_katsayi * 100) if max_katsayi > 0 else 0
 
@@ -274,21 +342,30 @@ def main():
             "dogru": dogru,
             "yanlis": yanlis,
             "bos": bos,
-            "toplam_soru": len(correct_answers)
+            "toplam_soru": len(correct_answers),
+            "sayisal_soru_sayisi": sayisal_sayisi,
+            "sozel_soru_sayisi": sozel_sayisi,
+            "degerlendirme_kriteri": {
+                "sayisal": "Tam eşleşme (90+)",
+                "sozel": "30 ve üzeri benzerlik DOĞRU"
+            }
         }
     }
     
     # Kaydet
-    output_file = f"output_yonetim/{os.path.splitext(os.path.basename(ocr_file))[0]}_evaluation.json"
-    os.makedirs("output_yonetim", exist_ok=True)
+    output_file = f"output_llm/{os.path.splitext(os.path.basename(ocr_file))[0]}_evaluation.json"
+    os.makedirs("output_llm", exist_ok=True)
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(final_result, f, indent=2, ensure_ascii=False)
     
-    print(f"\n{'='*50}")
-    print(f"📊 SONUÇ: {yuzdelik_puan:.1f}/100 ({dogru} doğru, {yanlis} yanlış, {bos} boş)")
+    print(f"\n{'='*60}")
+    print(f"📊 SONUÇ: {yuzdelik_puan:.1f}/100")
+    print(f"   Doğru: {dogru} | Yanlış: {yanlis} | Boş: {bos}")
+    print(f"   Sayısal Soru: {sayisal_sayisi} | Sözel Soru: {sozel_sayisi}")
+    print(f"   Kriter: Sözel sorularda %30 ve üzeri benzerlik DOĞRU kabul edildi")
     print(f"💾 Kaydedildi: {output_file}")
-    print(f"{'='*50}\n")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
